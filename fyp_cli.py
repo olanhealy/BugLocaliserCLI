@@ -102,7 +102,6 @@ def main():
     
     pred_class, confidence = classify_change(preprocessed_text)
     label = "Buggy" if pred_class == 1 else "Not Buggy"
-    s
     print("\n=== Bug Localisation Prediction ===")
     print(f"Label: {label} (Confidence: {confidence:.4f})")
     print("\n--- Preprocessed Input (truncated) ---")
