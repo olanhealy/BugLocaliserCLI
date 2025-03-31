@@ -45,7 +45,7 @@ def mask_identifiers(code):
     return ''.join(masked_tokens)
 
 # ---------------------------
-# LOAD MODEL & TOKENISER
+# LOAD MODEL & TOKENIZER
 # ---------------------------
 MODEL_DIR = "/app/FINAL_MODEL"
 
@@ -67,8 +67,22 @@ model.to(device)
 # ---------------------------
 # FUNCTIONS
 # ---------------------------
-def extract_code_context(diff_text):
-    lines = [line.rstrip() for line in diff_text.split("\n")]
+def split_hunks(diff_text):
+    hunks = []
+    current_hunk = []
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            if current_hunk:
+                hunks.append(current_hunk)
+            current_hunk = [line]
+        elif current_hunk:
+            current_hunk.append(line)
+    if current_hunk:
+        hunks.append(current_hunk)
+    return ["\n".join(hunk) for hunk in hunks]
+
+def extract_code_context(hunk):
+    lines = hunk.split("\n")
     context_lines = []
     snippet_lines_added = []
     snippet_lines_removed = []
@@ -77,18 +91,11 @@ def extract_code_context(diff_text):
     file_name = "UnknownFile.java"
 
     for i, line in enumerate(lines):
-        # Skip diff metadata
-        if line.startswith(("diff ", "index ", "--- ", "+++ ")):
-            if line.startswith("+++ "):
-                file_name = line[4:].strip().replace("b/", "").replace("\"", "")
-            continue
         if line.startswith("@@"):
             match = re.search(r"\+(\d+)", line)
             if match:
                 hunk_start_line = int(match.group(1))
             continue
-
-        # Detect changes from git diff
         if line.startswith("-") and not line.startswith("---"):
             snippet_lines_removed.append(line[1:].lstrip())
             found_change = True
@@ -101,30 +108,26 @@ def extract_code_context(diff_text):
 
     snippet_lines = snippet_lines_added if snippet_lines_added else snippet_lines_removed
     snippet_text = "\n".join(snippet_lines).strip()
-    context_text = "\n".join(context_lines[-3:])  
+    context_text = "\n".join(context_lines[-3:])
 
     return context_text, snippet_text, snippet_lines, file_name, hunk_start_line
 
-def preprocess_input(diff_text, commit_msg="No commit message", parent_commit=""):
-    context_text, snippet_text, snippet_lines, file_name, hunk_start = extract_code_context(diff_text)
-
-    context_text_masked = mask_identifiers(context_text)
-    snippet_text_masked = mask_identifiers(snippet_text)
-
-    input_text = (
-        f"[CONTEXT] {context_text_masked}\n"
-        f"[SNIPPET] {snippet_text_masked}\n"
+def preprocess_input(context, snippet, commit_msg, parent_commit):
+    context_masked = mask_identifiers(context)
+    snippet_masked = mask_identifiers(snippet)
+    return (
+        f"[CONTEXT] {context_masked}\n"
+        f"[SNIPPET] {snippet_masked}\n"
         f"[COMMIT] {commit_msg}\n"
         f"[PARENT] {parent_commit}"
     )
-    return input_text, snippet_lines, file_name, hunk_start
 
-def tokenise_for_model(text):
+def tokenize_for_model(text):
     encoded = tokenizer(text, truncation=True, padding="max_length", max_length=512, return_tensors="pt")
     return {k: v.to(device) for k, v in encoded.items()}
 
 def classify_change(input_text):
-    inputs = tokenise_for_model(input_text)
+    inputs = tokenize_for_model(input_text)
     with torch.no_grad():
         outputs = model(**inputs)
         logits = outputs.logits
@@ -140,32 +143,36 @@ def classify_change(input_text):
 def predict():
     data = request.get_json()
     diff_text = data.get("diff", "").strip()
-    commit_msg = data.get("commit_msg", "No commit message available").strip()
+    commit_msg = data.get("commit_msg", "No commit message").strip()
     parent_commit = data.get("parent_commit", "").strip()
 
     if not diff_text:
         return Response(json.dumps({"error": "No diff provided"}), status=400, mimetype="application/json")
 
-    input_text, snippet_lines, file_name, hunk_start = preprocess_input(diff_text, commit_msg, parent_commit)
-    logging.info(f"Model Input: {input_text}")
+    predictions = []
+    for hunk in split_hunks(diff_text):
+        context, snippet, snippet_lines, file_name, hunk_start = extract_code_context(hunk)
+        input_text = preprocess_input(context, snippet, commit_msg, parent_commit)
+        logging.info(f"Model Input: {input_text}")
 
-    pred, conf, logits, probs = classify_change(input_text)
-    label = "Buggy" if pred == 1 else "Not Buggy"
+        pred, conf, logits_tensor, probs_tensor = classify_change(input_text)
+        label = "Buggy" if pred == 1 else "Not Buggy"
 
-    result = {
-        "label": label,
-        "buggy_lines": snippet_lines if label == "Buggy" else [],
-        "confidence": round(conf, 4),
-        "probs": [round(p, 4) for p in probs.tolist()[0]],
-        "logits": [round(l, 4) for l in logits.tolist()[0]],
-        "file": file_name,
-        "hunk_start": hunk_start
-    }
+        result = {
+            "label": label,
+            "buggy_lines": snippet_lines if label == "Buggy" else [],
+            "confidence": round(float(conf), 4),
+            "probs": [round(float(x), 4) for x in probs_tensor.squeeze().tolist()],
+            "logits": [round(float(x), 4) for x in logits_tensor.squeeze().tolist()],
+            "file": file_name,
+            "hunk_start": hunk_start
+        }
 
-    logging.info(f"Prediction: {label} | Confidence: {conf:.4f}")
-    logging.info(f"Logits: {result['logits']} | Probs: {result['probs']}")
+        logging.info(f"Prediction: {label} | Confidence: {conf:.4f}")
+        logging.info(f"Logits: {result['logits']} | Probs: {result['probs']}")
+        predictions.append(result)
 
-    return Response(json.dumps(result, indent=4), status=200, mimetype="application/json")
+    return Response(json.dumps(predictions, indent=4), status=200, mimetype="application/json")
 
 # ---------------------------
 # MAIN

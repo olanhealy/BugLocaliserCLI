@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy requirements first to leverage Docker caching
+# Copy requirements 
 COPY requirements.txt /app/
 
 RUN pip install --upgrade pip && pip install -r requirements.txt

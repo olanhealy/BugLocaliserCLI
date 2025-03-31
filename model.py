@@ -2,6 +2,7 @@ import torch.nn as nn
 from transformers import RobertaModel, PreTrainedModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 
+# Custom model which I used while training 
 class CustomRobertaClassifier(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
