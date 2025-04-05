@@ -42,7 +42,7 @@ def mask_identifiers(code):
             masked_tokens.append(id_map[tok])
         else:
             masked_tokens.append(tok)
-    return ''.join(masked_tokens)
+    return ''.join(masked_tokens), id_map
 
 # ---------------------------
 # LOAD MODEL & TOKENIZER
@@ -50,10 +50,9 @@ def mask_identifiers(code):
 MODEL_DIR = "/app/FINAL_MODEL"
 
 tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
-special_tokens = {
+tokenizer.add_special_tokens({
     "additional_special_tokens": ["[CONTEXT]", "[SNIPPET]", "[COMMIT]", "[PARENT]"]
-}
-tokenizer.add_special_tokens(special_tokens)
+})
 
 config = RobertaConfig.from_pretrained("microsoft/codebert-base", num_labels=2)
 config.vocab_size = len(tokenizer)
@@ -65,7 +64,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 # ---------------------------
-# FUNCTIONS
+# CORE UTILS
 # ---------------------------
 def split_hunks(diff_text):
     hunks = []
@@ -81,7 +80,7 @@ def split_hunks(diff_text):
         hunks.append(current_hunk)
     return ["\n".join(hunk) for hunk in hunks]
 
-def extract_code_context(hunk):
+def extract_code_context(hunk, full_diff_lines):
     lines = hunk.split("\n")
     context_lines = []
     snippet_lines_added = []
@@ -90,7 +89,14 @@ def extract_code_context(hunk):
     hunk_start_line = None
     file_name = "UnknownFile.java"
 
-    for i, line in enumerate(lines):
+    hunk_index = full_diff_lines.index(lines[0])
+    for i in range(hunk_index, -1, -1):
+        line = full_diff_lines[i]
+        if line.startswith("+++ "):
+            file_name = line[4:].strip().replace("b/", "").replace("\"", "")
+            break
+
+    for line in lines:
         if line.startswith("@@"):
             match = re.search(r"\+(\d+)", line)
             if match:
@@ -100,6 +106,7 @@ def extract_code_context(hunk):
             snippet_lines_removed.append(line[1:].lstrip())
             found_change = True
         elif line.startswith("+") and not line.startswith("+++"):
+
             snippet_lines_added.append(line[1:].lstrip())
             found_change = True
         else:
@@ -109,18 +116,20 @@ def extract_code_context(hunk):
     snippet_lines = snippet_lines_added if snippet_lines_added else snippet_lines_removed
     snippet_text = "\n".join(snippet_lines).strip()
     context_text = "\n".join(context_lines[-3:])
-
     return context_text, snippet_text, snippet_lines, file_name, hunk_start_line
 
 def preprocess_input(context, snippet, commit_msg, parent_commit):
-    context_masked = mask_identifiers(context)
-    snippet_masked = mask_identifiers(snippet)
-    return (
+    context_masked, context_map = mask_identifiers(context)
+    snippet_masked, snippet_map = mask_identifiers(snippet)
+    combined_map = {**context_map, **snippet_map}
+
+    input_text = (
         f"[CONTEXT] {context_masked}\n"
         f"[SNIPPET] {snippet_masked}\n"
         f"[COMMIT] {commit_msg}\n"
         f"[PARENT] {parent_commit}"
     )
+    return input_text, combined_map, context, snippet
 
 def tokenize_for_model(text):
     encoded = tokenizer(text, truncation=True, padding="max_length", max_length=512, return_tensors="pt")
@@ -137,7 +146,7 @@ def classify_change(input_text):
     return pred_class, confidence, logits, probs
 
 # ---------------------------
-# FLASK ROUTE
+# FLASK ENDPOINT
 # ---------------------------
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -150,10 +159,20 @@ def predict():
         return Response(json.dumps({"error": "No diff provided"}), status=400, mimetype="application/json")
 
     predictions = []
+    full_diff_lines = diff_text.splitlines()
+
     for hunk in split_hunks(diff_text):
-        context, snippet, snippet_lines, file_name, hunk_start = extract_code_context(hunk)
-        input_text = preprocess_input(context, snippet, commit_msg, parent_commit)
-        logging.info(f"Model Input: {input_text}")
+        context, snippet, snippet_lines, file_name, hunk_start = extract_code_context(hunk, full_diff_lines)
+        input_text, _, orig_context, orig_snippet = preprocess_input(context, snippet, commit_msg, parent_commit)
+
+        # Log full unmasked input for debug
+        unmasked_log = (
+            f"[CONTEXT] {orig_context}\n"
+            f"[SNIPPET] {orig_snippet}\n"
+            f"[COMMIT] {commit_msg}\n"
+            f"[PARENT] {parent_commit}"
+        )
+        logging.info(f"Input:\n{unmasked_log}")
 
         pred, conf, logits_tensor, probs_tensor = classify_change(input_text)
         label = "Buggy" if pred == 1 else "Not Buggy"
@@ -175,7 +194,7 @@ def predict():
     return Response(json.dumps(predictions, indent=4), status=200, mimetype="application/json")
 
 # ---------------------------
-# MAIN
+# MAIN ENTRY
 # ---------------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)

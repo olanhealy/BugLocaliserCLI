@@ -11,6 +11,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+if [ "$SKIP_BUG_CHECK" = "1" ]; then
+    echo "⚠️ Bug localisation check skipped due to SKIP_BUG_CHECK=1"
+    exit 0
+fi
+
+
 if [ -z "$1" ]; then
     echo -e "${RED}No commit message file provided.${NC}"
     exit 1
